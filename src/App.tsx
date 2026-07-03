@@ -8,18 +8,63 @@ const COLS = 120;
 const ROWS = 60;
 const FONT_SIZE = 16;
 const FONT_FAMILY = '"JetBrains Mono", "Courier New", Courier, monospace';
+const MIN_CJK_TEXT_SPACING = 1;
+const MAX_CJK_TEXT_SPACING = 4;
+const DEFAULT_CJK_TEXT_SPACING = 2;
 
 const PROVIDER_CONFIGS = {
   gemini: { name: 'Google Gemini', model: 'gemini-3.1-pro-preview', baseURL: '' },
   openai: { name: 'OpenAI', model: 'gpt-4o', baseURL: 'https://api.openai.com/v1' },
   zhipu: { name: '智谱 (Zhipu)', model: 'glm-4v-plus', baseURL: 'https://open.bigmodel.cn/api/paas/v4' },
   stepfun: { name: '阶跃星辰 (StepFun)', model: 'step-1v-32k', baseURL: 'https://api.stepfun.com/v1' },
-  minimax: { name: 'MiniMax-M2.5', model: 'MiniMax-M2.5', baseURL: 'https://api.minimaxi.com/v1' },
-  moonshot: { name: 'Kimi 2.5 (Moonshot)', model: 'moonshot-v1-8k-vision-preview', baseURL: 'https://api.moonshot.cn/v1' },
+  minimax: { name: 'MiniMax M3', model: 'minimax-m3', baseURL: 'https://api.minimaxi.com/v1' },
+  moonshot: { name: 'Kimi K2.6 (Moonshot)', model: 'kimi-k2.6', baseURL: 'https://api.moonshot.cn/v1' },
   custom: { name: 'Custom (OpenAI Compatible)', model: '', baseURL: '' }
 };
 
 type ProviderKey = keyof typeof PROVIDER_CONFIGS;
+type ApiKeySource = 'manual' | 'local-file';
+type ApiConfig = {
+  provider: ProviderKey;
+  apiKey: string;
+  baseURL: string;
+  modelName: string;
+  apiKeySource?: ApiKeySource;
+};
+
+const DEFAULT_API_CONFIG: ApiConfig = {
+  provider: 'gemini',
+  apiKey: '',
+  baseURL: '',
+  modelName: 'gemini-3.1-pro-preview'
+};
+
+const isProviderKey = (provider: unknown): provider is ProviderKey => (
+  typeof provider === 'string' && provider in PROVIDER_CONFIGS
+);
+
+const clampCjkTextSpacing = (value: number) => (
+  Math.max(MIN_CJK_TEXT_SPACING, Math.min(MAX_CJK_TEXT_SPACING, Math.round(value)))
+);
+
+const isCjkChar = (char: string) => (
+  /[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\u3040-\u30FF\u3400-\u4DBF\uFF00-\uFFEF]/.test(char)
+);
+
+const fetchLocalApiKey = async (provider?: ProviderKey) => {
+  try {
+    const query = provider ? `?provider=${encodeURIComponent(provider)}` : '';
+    const response = await fetch(`/api/model-api-key${query}`, { cache: 'no-store' });
+    if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) return null;
+
+    const data = await response.json();
+    if (!data?.apiKey || !isProviderKey(data.provider)) return null;
+
+    return { provider: data.provider, apiKey: data.apiKey };
+  } catch {
+    return null;
+  }
+};
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -34,19 +79,24 @@ export default function App() {
   const [pendingImage, setPendingImage] = useState<{ base64: string; mimeType: string } | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const chatFileInputRef = useRef<HTMLInputElement>(null);
+  const textInputRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     const saved = localStorage.getItem('asc2_theme');
     return (saved as 'dark' | 'light') || 'dark';
   });
+  const [cjkTextSpacing, setCjkTextSpacing] = useState(() => {
+    const saved = Number(localStorage.getItem('asc2_cjk_text_spacing'));
+    return Number.isFinite(saved) && saved > 0 ? clampCjkTextSpacing(saved) : DEFAULT_CJK_TEXT_SPACING;
+  });
   
-  const [apiConfig, setApiConfig] = useState(() => {
+  const [apiConfig, setApiConfig] = useState<ApiConfig>(() => {
     const saved = localStorage.getItem('asc2_api_config');
-    return saved ? JSON.parse(saved) : {
-      provider: 'gemini' as ProviderKey,
-      apiKey: '',
-      baseURL: '',
-      modelName: 'gemini-3.1-pro-preview'
-    };
+    if (!saved) return DEFAULT_API_CONFIG;
+
+    const parsed = JSON.parse(saved) as Partial<ApiConfig>;
+    const provider = isProviderKey(parsed.provider) ? parsed.provider : DEFAULT_API_CONFIG.provider;
+    return { ...DEFAULT_API_CONFIG, ...parsed, provider };
   });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -58,9 +108,80 @@ export default function App() {
   
   const cellMetrics = useRef({ width: 9.6, height: 19.2 });
 
+  const focusTextInput = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      textInputRef.current?.focus({ preventScroll: true });
+    });
+  }, []);
+
   useEffect(() => {
-    localStorage.setItem('asc2_api_config', JSON.stringify(apiConfig));
+    const storedConfig = apiConfig.apiKeySource === 'local-file'
+      ? { ...apiConfig, apiKey: '' }
+      : apiConfig;
+    localStorage.setItem('asc2_api_config', JSON.stringify(storedConfig));
   }, [apiConfig]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const loadInitialApiKey = async () => {
+      const exactMatch = await fetchLocalApiKey(apiConfig.provider);
+      if (isCancelled) return;
+
+      if (exactMatch) {
+        const providerConfig = PROVIDER_CONFIGS[exactMatch.provider];
+        setApiConfig(prev => ({
+          ...prev,
+          provider: exactMatch.provider,
+          apiKey: exactMatch.apiKey,
+          apiKeySource: 'local-file',
+          baseURL: providerConfig.baseURL,
+          modelName: providerConfig.model || prev.modelName
+        }));
+        return;
+      }
+
+      if (apiConfig.apiKey) return;
+
+      const firstMatch = await fetchLocalApiKey();
+      if (isCancelled || !firstMatch) return;
+
+      const providerConfig = PROVIDER_CONFIGS[firstMatch.provider];
+      setApiConfig(prev => ({
+        ...prev,
+        provider: firstMatch.provider,
+        apiKey: firstMatch.apiKey,
+        apiKeySource: 'local-file',
+        baseURL: providerConfig.baseURL,
+        modelName: providerConfig.model || prev.modelName
+      }));
+    };
+
+    loadInitialApiKey();
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const loadProviderApiKey = async () => {
+      const exactMatch = await fetchLocalApiKey(apiConfig.provider);
+      if (isCancelled || !exactMatch || exactMatch.provider !== apiConfig.provider) return;
+
+      setApiConfig(prev => ({
+        ...prev,
+        apiKey: exactMatch.apiKey,
+        apiKeySource: 'local-file'
+      }));
+    };
+
+    loadProviderApiKey();
+    return () => {
+      isCancelled = true;
+    };
+  }, [apiConfig.provider]);
 
   useEffect(() => {
     localStorage.setItem('asc2_theme', theme);
@@ -70,6 +191,10 @@ export default function App() {
       document.documentElement.classList.remove('light');
     }
   }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem('asc2_cjk_text_spacing', String(cjkTextSpacing));
+  }, [cjkTextSpacing]);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -227,6 +352,113 @@ export default function App() {
     
     showToast('Saved as Markdown!');
   }, [getCanvasText, showToast]);
+
+  const insertTextAtCursor = useCallback((text: string) => {
+    if (!textCursorRef.current) return;
+
+    const pos = textCursorRef.current;
+    const grid = gridRef.current;
+
+    for (const char of Array.from(text.replace(/\r\n?/g, '\n'))) {
+      if (char === '\n') {
+        pos.y = Math.min(ROWS - 1, pos.y + 1);
+        continue;
+      }
+
+      if (/[\x00-\x1F\x7F]/.test(char)) continue;
+
+      grid[pos.y][pos.x] = char;
+      const nextX = pos.x + (isCjkChar(char) ? cjkTextSpacing : 1);
+      if (nextX >= COLS) {
+        pos.x = COLS - 1;
+        break;
+      }
+      pos.x = nextX;
+    }
+
+    draw();
+  }, [cjkTextSpacing, draw]);
+
+  const handleTextInput = useCallback((e: React.FormEvent<HTMLTextAreaElement>) => {
+    if (isComposingRef.current) return;
+
+    const value = e.currentTarget.value;
+    if (!value) return;
+
+    insertTextAtCursor(value);
+    e.currentTarget.value = '';
+  }, [insertTextAtCursor]);
+
+  const handleTextCompositionEnd = useCallback((e: React.CompositionEvent<HTMLTextAreaElement>) => {
+    isComposingRef.current = false;
+    const value = e.currentTarget.value || e.data;
+    if (!value) return;
+
+    insertTextAtCursor(value);
+    e.currentTarget.value = '';
+  }, [insertTextAtCursor]);
+
+  const handleTextInputKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (isSettingsOpen || isComposingRef.current) return;
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      setTool('box');
+      textCursorRef.current = null;
+      draw();
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+      e.preventDefault();
+      handleCopy();
+      return;
+    }
+
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      e.preventDefault();
+      handleExport();
+      return;
+    }
+
+    if (!textCursorRef.current) return;
+
+    const pos = textCursorRef.current;
+    const grid = gridRef.current;
+
+    if (['Backspace', 'Enter', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+      e.preventDefault();
+    }
+
+    if (e.key === 'Backspace') {
+      const scanStart = Math.max(0, pos.x - 1);
+      const scanEnd = Math.max(0, pos.x - cjkTextSpacing);
+      let deleteX = scanStart;
+
+      for (let x = scanStart; x >= scanEnd; x--) {
+        if (grid[pos.y][x] !== ' ') {
+          deleteX = x;
+          break;
+        }
+      }
+      pos.x = deleteX;
+      grid[pos.y][pos.x] = ' ';
+    } else if (e.key === 'Enter') {
+      pos.y = Math.min(ROWS - 1, pos.y + 1);
+    } else if (e.key === 'ArrowLeft') {
+      pos.x = Math.max(0, pos.x - 1);
+    } else if (e.key === 'ArrowRight') {
+      pos.x = Math.min(COLS - 1, pos.x + 1);
+    } else if (e.key === 'ArrowUp') {
+      pos.y = Math.max(0, pos.y - 1);
+    } else if (e.key === 'ArrowDown') {
+      pos.y = Math.min(ROWS - 1, pos.y + 1);
+    } else {
+      return;
+    }
+
+    draw();
+  }, [cjkTextSpacing, draw, handleCopy, handleExport, isSettingsOpen]);
 
   const handleImportImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -483,10 +715,22 @@ export default function App() {
 
   useEffect(() => {
     const handlePaste = (e: ClipboardEvent) => {
-      if (isSettingsOpen || document.activeElement?.tagName === 'INPUT') return; // Don't paste to canvas if typing in settings or chat
+      const isHiddenTextInputActive = document.activeElement === textInputRef.current;
+      if (
+        isSettingsOpen ||
+        document.activeElement?.tagName === 'INPUT' ||
+        (document.activeElement?.tagName === 'TEXTAREA' && !isHiddenTextInputActive)
+      ) return; // Don't paste to canvas if typing in settings or chat
       
       const text = e.clipboardData?.getData('text/plain');
       if (!text) return;
+      e.preventDefault();
+
+      if (tool === 'text' && textCursorRef.current) {
+        insertTextAtCursor(text);
+        showToast('Pasted from clipboard!');
+        return;
+      }
       
       const lines = text.split(/\r?\n/);
       const grid = gridRef.current;
@@ -528,11 +772,13 @@ export default function App() {
     
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
-  }, [tool, draw, showToast, isSettingsOpen]);
+  }, [tool, draw, insertTextAtCursor, showToast, isSettingsOpen]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const isHiddenTextInputActive = document.activeElement === textInputRef.current;
       if (isSettingsOpen || document.activeElement?.tagName === 'INPUT') return; // Disable canvas shortcuts when typing
+      if (isHiddenTextInputActive && tool === 'text') return;
 
       if (tool === 'text') {
         if (e.key === 'Escape') {
@@ -563,10 +809,18 @@ export default function App() {
         }
         
         if (e.key === 'Backspace') {
-          if (pos.x > 0) {
-            pos.x -= 1;
-            grid[pos.y][pos.x] = ' ';
+          const scanStart = Math.max(0, pos.x - 1);
+          const scanEnd = Math.max(0, pos.x - cjkTextSpacing);
+          let deleteX = scanStart;
+
+          for (let x = scanStart; x >= scanEnd; x--) {
+            if (grid[pos.y][x] !== ' ') {
+              deleteX = x;
+              break;
+            }
           }
+          pos.x = deleteX;
+          grid[pos.y][pos.x] = ' ';
         } else if (e.key === 'Enter') {
           pos.y = Math.min(ROWS - 1, pos.y + 1);
         } else if (e.key === 'ArrowLeft') {
@@ -578,8 +832,8 @@ export default function App() {
         } else if (e.key === 'ArrowDown') {
           pos.y = Math.min(ROWS - 1, pos.y + 1);
         } else if (e.key.length === 1) {
-          grid[pos.y][pos.x] = e.key;
-          pos.x = Math.min(COLS - 1, pos.x + 1);
+          insertTextAtCursor(e.key);
+          return;
         }
         
         draw();
@@ -608,7 +862,7 @@ export default function App() {
     
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [tool, draw, handleCopy, handleExport, isSettingsOpen]);
+  }, [tool, cjkTextSpacing, draw, handleCopy, handleExport, insertTextAtCursor, isSettingsOpen]);
 
   const getGridPos = (clientX: number, clientY: number) => {
     const canvas = canvasRef.current;
@@ -627,6 +881,7 @@ export default function App() {
     
     if (tool === 'text') {
       textCursorRef.current = pos;
+      focusTextInput();
       draw();
       return;
     }
@@ -758,10 +1013,18 @@ export default function App() {
     setApiConfig({
       ...apiConfig,
       provider,
+      apiKey: '',
+      apiKeySource: undefined,
       baseURL: PROVIDER_CONFIGS[provider].baseURL,
       modelName: PROVIDER_CONFIGS[provider].model
     });
   };
+
+  const handleCjkTextSpacingChange = (value: string) => {
+    setCjkTextSpacing(clampCjkTextSpacing(Number(value)));
+  };
+
+  const cjkSpacingPreview = `中${' '.repeat(cjkTextSpacing - 1)}文`;
 
   return (
     <div className={`min-h-screen flex flex-col font-sans selection:bg-emerald-500/30 ${theme === 'light' ? 'bg-zinc-50 text-zinc-900' : 'bg-zinc-950 text-zinc-300'}`}>
@@ -770,6 +1033,19 @@ export default function App() {
           {toast}
         </div>
       )}
+      <textarea
+        ref={textInputRef}
+        aria-label="Canvas text input"
+        tabIndex={-1}
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        className="fixed left-0 top-0 h-px w-px resize-none opacity-0 pointer-events-none"
+        onInput={handleTextInput}
+        onKeyDown={handleTextInputKeyDown}
+        onCompositionStart={() => { isComposingRef.current = true; }}
+        onCompositionEnd={handleTextCompositionEnd}
+      />
 
       {/* Settings Modal */}
       {isSettingsOpen && (
@@ -801,11 +1077,15 @@ export default function App() {
                 <input 
                   type="password"
                   value={apiConfig.apiKey}
-                  onChange={(e) => setApiConfig({...apiConfig, apiKey: e.target.value})}
+                  onChange={(e) => setApiConfig({...apiConfig, apiKey: e.target.value, apiKeySource: 'manual'})}
                   placeholder="sk-..."
                   className={`w-full border rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500 ${theme === 'light' ? 'bg-zinc-50 border-zinc-200 text-zinc-900' : 'bg-zinc-950 border-zinc-800 text-zinc-200'}`}
                 />
-                <p className={`text-xs mt-1 ${theme === 'light' ? 'text-zinc-500' : 'text-zinc-600'}`}>Stored securely in your browser's local storage.</p>
+                <p className={`text-xs mt-1 ${theme === 'light' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                  {apiConfig.apiKeySource === 'local-file'
+                    ? 'Loaded from Model ApiKey.md by the local dev server.'
+                    : "Stored in your browser's local storage when entered manually."}
+                </p>
               </div>
 
               {apiConfig.provider !== 'gemini' && (
@@ -920,6 +1200,49 @@ export default function App() {
         </aside>
 
         <main className={`flex-1 overflow-auto p-4 sm:p-8 flex items-start justify-start sm:items-center sm:justify-center relative ${theme === 'light' ? 'bg-zinc-100' : 'bg-zinc-950'}`}>
+          {tool === 'text' && (
+            <div className={`fixed left-24 right-4 top-20 z-20 flex max-w-xl flex-wrap items-center gap-3 rounded-lg border px-3 py-2 shadow-xl backdrop-blur-md sm:left-28 sm:right-auto ${theme === 'light' ? 'bg-white/90 border-zinc-200 text-zinc-700 shadow-zinc-200/70' : 'bg-zinc-900/90 border-zinc-800 text-zinc-300 shadow-black/40'}`}>
+              <div className="flex items-center gap-2">
+                <Type size={16} className="text-emerald-500" />
+                <label htmlFor="cjk-text-spacing" className={`text-xs font-medium ${theme === 'light' ? 'text-zinc-700' : 'text-zinc-300'}`}>
+                  中文字距
+                </label>
+              </div>
+
+              <input
+                type="range"
+                min={MIN_CJK_TEXT_SPACING}
+                max={MAX_CJK_TEXT_SPACING}
+                step={1}
+                value={cjkTextSpacing}
+                onChange={(e) => handleCjkTextSpacingChange(e.target.value)}
+                className="h-2 w-28 accent-emerald-500"
+                aria-label="Adjust Chinese text spacing"
+              />
+
+              <div className={`flex items-center overflow-hidden rounded-md border ${theme === 'light' ? 'border-zinc-200 bg-zinc-50' : 'border-zinc-700 bg-zinc-950'}`}>
+                <input
+                  id="cjk-text-spacing"
+                  type="number"
+                  min={MIN_CJK_TEXT_SPACING}
+                  max={MAX_CJK_TEXT_SPACING}
+                  step={1}
+                  value={cjkTextSpacing}
+                  onChange={(e) => handleCjkTextSpacingChange(e.target.value)}
+                  className={`w-12 border-0 bg-transparent px-2 py-1 text-center text-sm font-mono outline-none ${theme === 'light' ? 'text-zinc-900' : 'text-zinc-100'}`}
+                  aria-label="Chinese text spacing columns"
+                />
+                <span className={`border-l px-2 py-1 text-xs ${theme === 'light' ? 'border-zinc-200 text-zinc-500' : 'border-zinc-700 text-zinc-500'}`}>
+                  格
+                </span>
+              </div>
+
+              <output className={`rounded-md px-2 py-1 font-mono text-sm whitespace-pre ${theme === 'light' ? 'bg-zinc-100 text-zinc-700' : 'bg-zinc-800 text-zinc-200'}`}>
+                {cjkSpacingPreview}
+              </output>
+            </div>
+          )}
+
           <div className={`relative shadow-2xl border rounded-lg overflow-hidden ${theme === 'light' ? 'bg-white border-zinc-200 shadow-zinc-200' : 'bg-zinc-900 border-zinc-800/80 shadow-black/50'}`}>
             <canvas
               ref={canvasRef}
