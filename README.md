@@ -17,8 +17,8 @@ ASC2 Flow supports multiple Vision AI models to convert images to ASCII. API Key
 
 - **Google Gemini** (`gemini-3.1-pro-preview`)
 - **OpenAI** (`gpt-4o`)
-- **Kimi 2.5** (`moonshot-v1-8k-vision-preview`)
-- **MiniMax 2.5** (`minimax-vl-01`)
+- **Kimi K2.6** (`kimi-k2.6`)
+- **MiniMax M3** (`minimax-m3`)
 - **智谱 Zhipu** (`glm-4v-plus`)
 - **阶跃星辰 StepFun** (`step-1v-32k`)
 - **Custom**: Any OpenAI-compatible REST API.
@@ -47,6 +47,22 @@ If you want to run ASC2 Flow locally as a personal tool without deploying it to 
 2. Make the script executable: `chmod +x start-mac-linux.sh`
 3. Run the script: `./start-mac-linux.sh`
 4. Open your browser to `http://localhost:3000`.
+
+### Local API Key Markdown
+
+When running locally with Vite, ASC2 Flow automatically tries to load API keys from `../yuxinlu/doc/Model ApiKey.md`. You can override the path with `MODEL_API_KEY_FILE`.
+
+Supported Markdown lines can look like:
+
+```text
+1-GLM coding plan
+APIKEY: your-key
+
+2-Kimi For Coding
+APIKEY: your-key
+```
+
+Loaded keys are served only by the local dev server and are not written to `localStorage`.
 
 ### For Windows 11:
 1. Double-click the `start-windows.bat` file.
